@@ -1,0 +1,183 @@
+name: Sync Fork Releases
+
+# 用途：
+#   GitHub 的 Fork 不会复制上游仓库的 Releases，所以 Fork 的 Releases 页面是空的。
+#   本工作流把上游仓库（默认 MetaCubeX/ClashMetaForAndroid）的 Releases 镜像到当前 Fork，
+#   包括 Release 标题、说明、预发行版标记以及全部 APK 附件。
+#
+# 使用方式：
+#   1. 在 Fork 仓库（例如 uuuren/ClashMetaForAndroid）中保留本文件；
+#   2. Settings -> Actions -> General -> Workflow permissions 选择 "Read and write permissions"；
+#   3. 进入 Actions -> Sync Fork Releases -> Run workflow 手动跑一次；
+#   4. 之后每天 03:17 (UTC) 会自动同步一次。
+#
+# 注意：如果本仓库就是上游仓库本身，工作流会自动跳过，不做任何修改。
+
+on:
+  schedule:
+    # 每天 03:17 (UTC) 自动同步
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream:
+        description: "上游仓库 owner/repo（留空使用默认值）"
+        required: false
+        default: "MetaCubeX/ClashMetaForAndroid"
+      release_limit:
+        description: "同步最近多少个正式版本"
+        required: false
+        default: "3"
+      include_prerelease:
+        description: "是否同步预发行版（如 Prerelease-alpha）"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      force_update_prerelease:
+        description: "预发行版已存在时删除重建（保证内容最新）"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      sync_code:
+        description: "是否同时把上游 main 快进合并到本 Fork"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-releases
+  cancel-in-progress: false
+
+jobs:
+  sync-code:
+    name: Sync fork code
+    if: github.event_name == 'workflow_dispatch' && inputs.sync_code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Fast-forward main from upstream
+        env:
+          UPSTREAM: ${{ inputs.upstream }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM="${UPSTREAM:-MetaCubeX/ClashMetaForAndroid}"
+
+          if [ "${UPSTREAM}" = "${GITHUB_REPOSITORY}" ]; then
+            echo "当前仓库就是上游仓库，跳过代码同步。"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null || true
+          git fetch upstream main --tags
+
+          if git merge --ff-only upstream/main; then
+            git push origin main
+            git push origin --tags
+            echo "Fork 的 main 已快进到上游最新提交。"
+          else
+            echo "::warning::Fork 的 main 与上游已分叉，无法快进合并，已跳过代码同步（Releases 镜像不受影响）。"
+          fi
+
+  sync-releases:
+    name: Mirror upstream releases
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      UPSTREAM: ${{ inputs.upstream }}
+      RELEASE_LIMIT: ${{ inputs.release_limit }}
+      INCLUDE_PRERELEASE: ${{ inputs.include_prerelease }}
+      FORCE_UPDATE_PRERELEASE: ${{ inputs.force_update_prerelease }}
+    steps:
+      - name: Mirror releases into this fork
+        run: |
+          set -euo pipefail
+
+          UPSTREAM="${UPSTREAM:-MetaCubeX/ClashMetaForAndroid}"
+          FORK="${GITHUB_REPOSITORY}"
+          LIMIT="${RELEASE_LIMIT:-3}"
+          INCLUDE_PRE="${INCLUDE_PRERELEASE:-true}"
+          FORCE_PRE="${FORCE_UPDATE_PRERELEASE:-true}"
+
+          if [ "${UPSTREAM}" = "${FORK}" ]; then
+            echo "当前仓库就是上游仓库，无需镜像 Releases。"
+            exit 0
+          fi
+
+          echo "上游: ${UPSTREAM}"
+          echo "目标: ${FORK}"
+
+          releases_json="$(gh api "repos/${UPSTREAM}/releases?per_page=50")"
+
+          if [ "${INCLUDE_PRE}" = "true" ]; then
+            pre_flag=true
+          else
+            pre_flag=false
+          fi
+
+          tags="$(printf '%s' "${releases_json}" | jq -r \
+            --argjson limit "${LIMIT}" \
+            --argjson include_pre "${pre_flag}" '
+              [ .[] | select(.draft == false) ] as $all
+              | ( [ $all[] | select(.prerelease == false) ][0:$limit] | map(.tag_name) )
+                + ( if $include_pre then [ $all[] | select(.prerelease == true) ] | map(.tag_name) else [] end )
+              | .[]')"
+
+          if [ -z "${tags}" ]; then
+            echo "上游没有可同步的 Release。"
+            exit 0
+          fi
+
+          for tag in ${tags}; do
+            echo "==== 处理 ${tag} ===="
+
+            meta="$(printf '%s' "${releases_json}" | jq -c --arg t "${tag}" '.[] | select(.tag_name == $t)')"
+            title="$(printf '%s' "${meta}" | jq -r '.name // .tag_name')"
+            is_pre="$(printf '%s' "${meta}" | jq -r '.prerelease')"
+
+            if gh release view "${tag}" -R "${FORK}" >/dev/null 2>&1; then
+              if [ "${is_pre}" = "true" ] && [ "${FORCE_PRE}" = "true" ]; then
+                echo "预发行版 ${tag} 已存在，删除后重建。"
+                gh release delete "${tag}" -R "${FORK}" --yes --cleanup-tag >/dev/null 2>&1 || true
+              else
+                echo "Release ${tag} 已存在，跳过。"
+                continue
+              fi
+            fi
+
+            dist="$(mktemp -d)"
+            notes="$(mktemp)"
+
+            printf '%s' "${meta}" | jq -r '.body // ""' > "${notes}"
+
+            if ! gh release download "${tag}" -R "${UPSTREAM}" -D "${dist}" --skip-existing; then
+              echo "::warning::${tag} 没有可下载的附件，或附件下载失败。"
+            fi
+
+            shopt -s nullglob
+            assets=( "${dist}"/* )
+            shopt -u nullglob
+
+            create_args=( --title "${title}" --notes-file "${notes}" --target "${GITHUB_SHA}" )
+            if [ "${is_pre}" = "true" ]; then
+              create_args+=( --prerelease )
+            fi
+
+            if [ "${#assets[@]}" -gt 0 ]; then
+              gh release create "${tag}" -R "${FORK}" "${create_args[@]}" "${assets[@]}"
+            else
+              gh release create "${tag}" -R "${FORK}" "${create_args[@]}"
+            fi
+
+            rm -rf "${dist}" "${notes}"
+            echo "已把 ${tag} 同步到 ${FORK}"
+          done
